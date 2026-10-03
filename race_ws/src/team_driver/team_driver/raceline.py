@@ -268,10 +268,139 @@ def min_curvature(grid, ref, margin, iterations=3):
     return line
 
 
+
+
+# ---------------------------------------------------------------------------
+# Car limits, measured from the judged simulator (f1tenth_gym single-track
+# model with the f1tenth parameters). Its tyres are linear, so sideways grip
+# is effectively unlimited; what limits a corner is STEERING. Holding full
+# lock at speed v, the car follows a curve of at most
+#     k_max(v) = K0 / (1 + KC * v^2)      [1/m]
+# (fitted to the simulator: 1.23 at 2 m/s, 0.90 at 7 m/s, 0.69 at 10 m/s).
+# Acceleration is capped at A_MAX, and above V_SWITCH at A_MAX * V_SWITCH / v.
+# ---------------------------------------------------------------------------
+K0, KC = 1.269, 0.0084
+A_MAX, V_SWITCH = 9.51, 7.319
+LR = 0.17145          # rear axle to centre of gravity [m]
+
+
+def speed_limit_sq(k, v_max, a_lat, steer_use):
+    """Highest v^2 at each point from: top speed, a lateral-acceleration cap,
+    and using at most `steer_use` (0..1) of the steering available."""
+    k = np.maximum(k, 1e-6)
+    steer = (steer_use * K0 / k - 1.0) / KC
+    return np.maximum(np.minimum.reduce([np.full_like(k, v_max ** 2), a_lat / k, steer]), 0.25)
+
+# ---------------------------------------------------------------------------
+# 6b. Minimum-TIME line (what a racing driver actually does)
+# ---------------------------------------------------------------------------
+def fast_speed_squared(xy, v_max, a_lat, a_brake, a_accel, steer_use=0.8):
+    """Vectorised speed profile, returned as v^2. Same physics as
+    speed_profile() but written as prefix-minimum scans so it takes
+    microseconds, which lets the optimiser call it thousands of times.
+    Backward pass:  v_i^2 = min_j>=i ( vlim_j^2 + 2 a_brake (s_j - s_i) )
+    Forward pass:   v_i^2 = min_j<=i ( v_j^2 + 2 a_accel (s_i - s_j) )
+    The arrays are doubled so the limits wrap across the finish line."""
+    n = len(xy)
+    k = curvature_of(xy)
+    ds = np.linalg.norm(np.roll(xy, -1, 0) - xy, axis=1)
+    lim = speed_limit_sq(k, v_max, a_lat, steer_use)
+    a_accel = min(a_accel, A_MAX * V_SWITCH / max(math.sqrt(v_max ** 2), V_SWITCH))
+    s2 = np.concatenate([[0.0], np.cumsum(np.tile(ds, 2))])[:-1]
+    l2 = np.tile(lim, 2)
+    back = np.minimum.accumulate((l2 + 2 * a_brake * s2)[::-1])[::-1] - 2 * a_brake * s2
+    back = np.tile(back[:n], 2)
+    fwd = 2 * a_accel * s2 + np.minimum.accumulate(back - 2 * a_accel * s2)
+    return fwd[n:], ds
+
+
+def lap_time(xy, v_max, a_lat, a_brake, a_accel, steer_use=0.8):
+    w, ds = fast_speed_squared(xy, v_max, a_lat, a_brake, a_accel, steer_use)
+    v = np.sqrt(np.maximum(w, 0.01))
+    return float(np.sum(2.0 * ds / (v + np.roll(v, -1))))
+
+
+def periodic_spline_basis(n, every):
+    """n x m matrix B: offsets at all n points = B @ offsets at m control
+    points, joined by a smooth periodic cubic spline."""
+    from scipy.interpolate import CubicSpline
+    ctrl = np.arange(0, n, every)
+    m = len(ctrl)
+    t = np.arange(n)
+    B = np.zeros((n, m))
+    for j in range(m):
+        e = np.zeros(m + 1)
+        e[j] = 1.0
+        if j == 0:
+            e[m] = 1.0
+        B[:, j] = CubicSpline(np.append(ctrl, n), e, bc_type='periodic')(t)
+    return B, ctrl
+
+
+def min_time(grid, ref, margin, v_max, a_lat, a_brake, a_accel, steer_use=0.8,
+             every=4, time_budget=25.0, log=print):
+    """Choose sideways offsets (smooth spline, inside the corridor) that make
+    the predicted lap time as small as possible. Starts from the
+    minimum-curvature answer and lets L-BFGS-B trade curvature against where
+    in the lap it matters: late apexes, braking deeper, using all the exit
+    width to get on the power early."""
+    import time as _time
+    from scipy.optimize import minimize
+    centre = ref
+    n = len(centre)
+    nrm = normals_of(centre)
+    left, right = corridor_bounds(grid, centre, nrm, margin)
+    lo, hi = -right, np.maximum(left, -right + 1e-3)
+    B, ctrl = periodic_spline_basis(n, every)
+    m = len(ctrl)
+    # Control-point bounds: the tightest corridor between neighbouring controls.
+    lo_c, hi_c = np.empty(m), np.empty(m)
+    for j in range(m):
+        span = np.arange(ctrl[j] - every // 2, ctrl[j] + every // 2 + 1) % n
+        lo_c[j], hi_c[j] = lo[span].max(), hi[span].min()
+    hi_c = np.maximum(hi_c, lo_c + 1e-3)
+
+    # Start from the reference itself (the minimum-curvature line): u = 0.
+    u0 = np.zeros(m)
+
+    def line_of(u):
+        return centre + np.clip(B @ u, lo, hi)[:, None] * nrm
+
+    def cost(u):
+        a = B @ u
+        over = np.maximum(a - hi, 0) + np.maximum(lo - a, 0)
+        return lap_time(centre + a[:, None] * nrm, v_max, a_lat, a_brake, a_accel, steer_use) \
+            + 200.0 * float(np.sum(over ** 2))
+
+    t0 = _time.time()
+    best = {'u': u0, 'f': cost(u0)}
+    start_f = best['f']
+
+    class Budget(Exception):
+        pass
+
+    def tracked(u):
+        f = cost(u)
+        if f < best['f']:
+            best['u'], best['f'] = u.copy(), f
+        if _time.time() - t0 > time_budget:
+            raise Budget
+        return f
+
+    try:
+        minimize(tracked, u0, method='L-BFGS-B', bounds=list(zip(lo_c, hi_c)),
+                 options={'maxiter': 400, 'eps': 1e-4})
+    except Budget:
+        log(f'min-time: stopped at the {time_budget:.0f} s time budget')
+    log(f'min-time: predicted lap {start_f:.2f} s (min curvature) -> {best["f"]:.2f} s '
+        f'in {_time.time() - t0:.1f} s')
+    return line_of(best['u'])
+
+
 # ---------------------------------------------------------------------------
 # 7. Speed profile
 # ---------------------------------------------------------------------------
-def curvature_of(xy):
+def curvature_of(xy, smooth=True):
     prev, nxt = np.roll(xy, 1, 0), np.roll(xy, -1, 0)
     a = np.linalg.norm(xy - prev, axis=1)
     b = np.linalg.norm(nxt - xy, axis=1)
@@ -279,25 +408,32 @@ def curvature_of(xy):
     d1, d2 = xy - prev, nxt - xy
     cross = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
     k = 2.0 * np.abs(cross) / np.maximum(a * b * c, 1e-9)
-    k = np.convolve(np.r_[k[-3:], k, k[:3]], np.ones(7) / 7, 'valid')
+    if smooth:
+        k = np.convolve(np.r_[k[-3:], k, k[:3]], np.ones(7) / 7, 'valid')
     return k
 
 
-def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel):
-    """v <= sqrt(a_lat / curvature) in corners; then a backward pass (brake in
-    time for every corner) and a forward pass (can only speed up so fast).
-    Both passes run twice so the limits carry across the start/finish line."""
+def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel, steer_use=0.8):
+    """Target speed at every point of the line.
+      1. corner limit: the speed at which the car can still follow this
+         curvature using `steer_use` of its steering (and a_lat, if lower);
+      2. backward pass: brake at a_brake so every corner is reached slowly
+         enough;
+      3. forward pass: accelerate at most a_accel, and less above V_SWITCH,
+         as the simulator's motor does.
+    Both passes run twice so the limits carry across the finish line."""
     n = len(xy)
     k = curvature_of(xy)
     ds = np.linalg.norm(np.roll(xy, -1, 0) - xy, axis=1)
-    v = np.minimum(v_max, np.sqrt(a_lat / np.maximum(k, 1e-6)))
+    v = np.sqrt(speed_limit_sq(k, v_max, a_lat, steer_use))
     for _ in range(2):
         for i in range(n - 1, -1, -1):
             j = (i + 1) % n
             v[i] = min(v[i], math.sqrt(v[j] ** 2 + 2.0 * a_brake * ds[i]))
         for i in range(n):
             j = (i + 1) % n
-            v[j] = min(v[j], math.sqrt(v[i] ** 2 + 2.0 * a_accel * ds[i]))
+            acc = min(a_accel, A_MAX * V_SWITCH / max(v[i], V_SWITCH))
+            v[j] = min(v[j], math.sqrt(v[i] ** 2 + 2.0 * acc * ds[i]))
     return np.maximum(v, v_min)
 
 
@@ -315,16 +451,31 @@ def load_track(tracks_yaml, name=None):
     return map_yaml, [tuple(p) for p in t['finish_line']], tuple(t['start_pose'])
 
 
-def build_raceline(tracks_yaml, margin=0.35, spacing=0.2, blend=1.0, log=print):
-    """Returns (centreline, raceline) as N x 2 arrays in the racing direction.
-    blend: 0 = centreline, 1 = full minimum-curvature line."""
+def load_grid(tracks_yaml):
+    """The map with cone rows sealed and the wall-distance field computed."""
     map_yaml, finish, start = load_track(tracks_yaml)
     grid = GridMap(map_yaml)
-    links = seal_cone_rows(grid)
+    grid.cone_links = seal_cone_rows(grid)
     grid.update_clearance()
+    return grid, finish, start
+
+
+def build_raceline(tracks_yaml, margin=0.35, spacing=0.2, blend=1.0, log=print,
+                   optimise_time=True, car=None, time_budget=25.0, grid=None):
+    """Returns (centreline, raceline) as N x 2 arrays in the racing direction.
+    blend: 0 = centreline, 1 = full minimum-curvature line."""
+    if grid is None:
+        grid, finish, start = load_grid(tracks_yaml)
+    else:
+        _, finish, start = load_track(tracks_yaml)
+    links = grid.cone_links
     lap = trace_lap(grid, finish, start)
     centre = resample_closed(smooth_closed(lap, 9), spacing)
     race = min_curvature(grid, centre, margin)
+    if optimise_time:
+        car = car or dict(v_max=10.0, a_lat=30.0, a_brake=8.0, a_accel=8.0, steer_use=0.8)
+        race = resample_closed(min_time(grid, race, margin, time_budget=time_budget, log=log, **car),
+                               spacing)
     if blend < 1.0:
         idx = np.array([np.argmin(np.hypot(*(race - p).T)) for p in centre])
         race = resample_closed(centre + blend * (race[idx] - centre), spacing)
@@ -352,7 +503,7 @@ if __name__ == '__main__':
     import sys
     tracks = sys.argv[1] if len(sys.argv) > 1 else '/hackathon/maps/tracks.yaml'
     centre, race = build_raceline(tracks)
-    v = speed_profile(race, 8.0, 1.5, 5.0, 5.0, 4.0)
+    v = speed_profile(race, 9.0, 1.5, 5.0, 8.5, 9.5, 1.0)
     out = sys.argv[2] if len(sys.argv) > 2 else 'raceline.csv'
     np.savetxt(out, np.column_stack([race, v]), delimiter=',', fmt='%.4f',
                header='x_m, y_m, v_mps  (generated by raceline.py)')
