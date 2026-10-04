@@ -413,23 +413,30 @@ def curvature_of(xy, smooth=True):
     return k
 
 
-def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel, steer_use=0.8):
+def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel, steer_use=0.8, trail=1.0):
     """Target speed at every point of the line.
       1. corner limit: the speed at which the car can still follow this
          curvature using `steer_use` of its steering (and a_lat, if lower);
-      2. backward pass: brake at a_brake so every corner is reached slowly
-         enough;
+      2. backward pass: brake so every corner is reached slowly enough. Hard
+         braking while turning unloads the rear wheels and the tail slides, so
+         the braking allowed shrinks as the corner uses up its limit:
+             brake = a_brake * sqrt(1 - (trail * v^2 / v_corner^2)^2)
+         i.e. brake hard in a straight line, ease off while turning in.
+         trail = 0 switches this off (full braking right up to the apex).
       3. forward pass: accelerate at most a_accel, and less above V_SWITCH,
          as the simulator's motor does.
     Both passes run twice so the limits carry across the finish line."""
     n = len(xy)
     k = curvature_of(xy)
     ds = np.linalg.norm(np.roll(xy, -1, 0) - xy, axis=1)
-    v = np.sqrt(speed_limit_sq(k, v_max, a_lat, steer_use))
+    vc = np.sqrt(speed_limit_sq(k, 1e3, a_lat, steer_use))   # corner limit, uncapped
+    v = np.minimum(vc, v_max)
     for _ in range(2):
         for i in range(n - 1, -1, -1):
             j = (i + 1) % n
-            v[i] = min(v[i], math.sqrt(v[j] ** 2 + 2.0 * a_brake * ds[i]))
+            used = min(1.0, trail * (v[j] / vc[i]) ** 2)
+            brake = a_brake * max(0.12, math.sqrt(1.0 - used * used))
+            v[i] = min(v[i], math.sqrt(v[j] ** 2 + 2.0 * brake * ds[i]))
         for i in range(n):
             j = (i + 1) % n
             acc = min(a_accel, A_MAX * V_SWITCH / max(v[i], V_SWITCH))

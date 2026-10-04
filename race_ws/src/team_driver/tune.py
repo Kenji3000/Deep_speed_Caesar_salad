@@ -5,8 +5,11 @@ keeps whatever gives the lowest time with no collisions.
 Run INSIDE the container, with nothing else running (it starts its own
 simulator, headless, through ./scripts/evaluate.sh):
 
-    python3 /hackathon/race_ws/src/team_driver/tune.py              # default: 40 runs
-    python3 /hackathon/race_ws/src/team_driver/tune.py --runs 100 --laps 3
+    python3 /hackathon/race_ws/src/team_driver/tune.py              # default: 40 runs of 10 laps
+    python3 /hackathon/race_ws/src/team_driver/tune.py --runs 60
+
+Each try is a full 10-lap race (about 3 minutes), because a setting that
+slides near the limit can survive 3 laps by luck and crash on lap 7.
 
 Stop any time with Ctrl+C and run it again later: every result is saved in
 results/tuning/log.csv and is reused, so nothing is raced twice.
@@ -35,15 +38,14 @@ LOG = os.path.join(OUT, 'log.csv')
 
 # name: (start value, step, lowest allowed, highest allowed)
 SPACE = {
-    'a_lat':         (20.0, 1.0, 8.0, 30.0),
+    'a_lat':         (17.0, 1.0, 8.0, 26.0),
     'steer_use':     (0.95, 0.05, 0.6, 1.0),
     'v_max':         (11.0, 1.0, 8.0, 15.0),
     'margin':        (0.35, 0.025, 0.30, 0.50),
     'a_brake':       (8.0, 0.5, 5.0, 9.5),
-    'a_accel':       (9.5, 0.5, 5.0, 9.5),
-    'mpc_w_line':    (8.0, 2.0, 1.0, 16.0),
+    'trail':         (1.0, 0.2, 0.0, 1.4),
+    'esc_slip':      (0.40, 0.05, 0.25, 0.80),
     'mpc_w_slip':    (30.0, 10.0, 0.0, 80.0),
-    'mpc_latency':   (0.03, 0.01, 0.0, 0.06),
 }
 
 
@@ -96,13 +98,15 @@ def race(params, laps, evaluate):
     if result.get('status') != 'COMPLETE' or not result.get('scored'):
         return float('inf'), result
     score = float(result['total_time']) + 20.0 * int(result.get('collisions', 0))
+    # A candidate only replaces the best if it wins clearly: the same settings
+    # vary by a second or so between runs because of this machine's timing.
     return score, result
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--runs', type=int, default=40, help='new races to run this session')
-    ap.add_argument('--laps', type=int, default=3, help='timed laps per race')
+    ap.add_argument('--laps', type=int, default=10, help='timed laps per race')
     ap.add_argument('--evaluate', default=os.path.join(REPO, 'scripts', 'evaluate.sh'))
     ap.add_argument('--only', default='', help='comma list of parameters to tune, e.g. a_lat,a_brake')
     args = ap.parse_args()
@@ -150,7 +154,7 @@ def main():
                     if trial[n] == best[n]:
                         continue
                     s = evaluate(trial)
-                    if s < best_score:
+                    if s < best_score - 1.0:
                         best, best_score, improved = trial, s, True
                         print(f'  NEW BEST {best_score:.2f}: {n}={trial[n]:g}', flush=True)
                         break
