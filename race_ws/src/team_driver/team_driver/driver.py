@@ -20,17 +20,20 @@ How it works
      command per physics step from a 10-deep queue, so the driver sends at
      most one command every two steps, ignores repeated or stale odometry,
      and measures the real command delay from how the car's speed responds.
-  5. Fallback: `controller:=pure_pursuit` (or any MPC error) switches to Pure
+  5. Delay guard: the speed plan assumes commands reach the car within
+     `guard_delay` (30 ms). If the measured delay is longer on some machine,
+     the driver switches to a slower speed plan on the same line.
+  6. Fallback: `controller:=pure_pursuit` (or any MPC error) switches to Pure
      Pursuit with understeer compensation on a slower, safer speed plan.
 
-Defaults were chosen in a replica of the judged simulator's physics with
-irregular command delays (10-90 ms): about 10.6 s per lap, 0 contacts over 10
-laps. The main speed knob is `a_lat`: 17 is the safe default; 20 gave about
-10.0 s but can slide into a wall when the machine's timing is poor. Watch the
-"MPC: ..." log line: it shows how long each solve takes and the biggest slide.
+Defaults were found by tune.py (10-lap races in the judged simulator) and
+checked in a replica of its physics. The main speed knob is `a_lat`: 24 gives
+about 9.6 s laps with a 20-30 ms command delay; 25 touches walls. Watch the
+"MPC: ..." log line: it shows the solve time, the biggest slide and the
+measured command delay.
 
 Tune without editing code, e.g.:
-    ros2 run team_driver driver --ros-args -p a_lat:=18.0 -p margin:=0.40
+    ros2 run team_driver driver --ros-args -p a_lat:=22.0 -p margin:=0.40
 """
 
 import collections
@@ -73,7 +76,7 @@ class Driver(Node):
         # corners are limited by steering, not grip - see raceline.py)
         self.declare_parameter('v_max', 11.0)          # [m/s] top speed
         self.declare_parameter('v_min', 1.5)           # [m/s] slowest target speed
-        self.declare_parameter('a_lat', 17.0)          # [m/s^2] cap on sideways acceleration
+        self.declare_parameter('a_lat', 24.0)          # [m/s^2] cap on sideways acceleration
         self.declare_parameter('steer_use', 0.95)      # share of full steering a corner may need
         self.declare_parameter('a_brake', 8.0)         # [m/s^2] braking before corners
         self.declare_parameter('trail', 1.0)           # 0..1: ease off the brakes while turning in
@@ -95,6 +98,10 @@ class Driver(Node):
         self.declare_parameter('mpc_temperature', 0.1) # lower = trust only the best plans
         self.declare_parameter('mpc_latency', 0.02)    # [s] command delay assumed until it is measured
         self.declare_parameter('delay_auto', True)     # measure the real command delay while driving
+        self.declare_parameter('delay_guard', True)    # slower speed plan if commands arrive late
+        self.declare_parameter('guard_delay', 0.03)    # [s] full speed plan up to this delay
+        self.declare_parameter('guard_a_lat', 20.0)    # [m/s^2] a_lat cap at 10 ms above that
+        self.declare_parameter('guard_step', 2.0)      # [m/s^2] lower the cap per further 10 ms
         self.declare_parameter('mpc_seed', 0)          # random seed of the plan sampler
         self.declare_parameter('mpc_engine', 'auto')   # 'auto' (compiled if possible) or 'numpy'
         # Pure Pursuit (fallback)
@@ -135,6 +142,22 @@ class Driver(Node):
             self.line, min(g('pp_v_max'), g('v_max')), g('v_min'), min(g('pp_a_lat'), g('a_lat')),
             g('a_brake'), g('a_accel'), 1.0, g('trail'))
         self.spacing = raceline.lap_length(self.line) / len(self.line)
+        # Delay guard: slower speed plans on the same line, for a machine
+        # where commands reach the car late. Plan 0 is the full one; plan k is
+        # used when the measured delay is k steps (10 ms each) over guard_delay.
+        self.speed_plans = [self.line_speed]
+        self.plan_a_lat = [g('a_lat')]
+        self.guard_delay = g('guard_delay')
+        if bool(self._raw('delay_guard')):
+            for k in range(1, 6):
+                cap = min(g('a_lat'), max(10.0, g('guard_a_lat') - (k - 1) * g('guard_step')))
+                slower = raceline.speed_profile(
+                    self.line, g('v_max'), g('v_min'), cap, g('a_brake'), g('a_accel'),
+                    g('steer_use'), g('trail'))
+                self.speed_plans.append(np.minimum(slower, self.line_speed))
+                self.plan_a_lat.append(cap)
+        self.guard_level = 0           # which speed plan is in use
+        self.guard_votes = 0           # measurements in a row asking for another plan
         self.get_logger().info(
             f'{len(self.line)} line points, {raceline.lap_length(self.line):.1f} m, '
             f'speeds {self.line_speed.min():.1f}-{self.line_speed.max():.1f} m/s')
@@ -231,6 +254,7 @@ class Driver(Node):
         'mpc_period': (0.01, 0.1), 'mpc_samples': (16, 2048), 'mpc_horizon': (0.3, 2.0),
         'mpc_dt': (0.01, 0.06), 'mpc_knots': (3, 20), 'mpc_noise': (0.005, 0.4),
         'mpc_temperature': (0.02, 5.0), 'mpc_latency': (0.0, 0.1),
+        'guard_delay': (0.0, 0.1), 'guard_a_lat': (5.0, 80.0), 'guard_step': (0.0, 10.0),
         'mpc_wall_soft': (0.18, 0.8), 'pp_a_lat': (1.0, 9.0), 'pp_v_max': (1.0, 12.0),
     }
 
@@ -415,6 +439,31 @@ class Driver(Node):
         self.delay_err = [0.8 * e0 + 0.2 * e / pairs for e0, e in zip(self.delay_err, errs)]
         best = min(range(12), key=lambda k: self.delay_err[k])
         self.delay = (best + 1) * 0.01
+        self.guard_update()
+
+    def guard_update(self):
+        """Delay guard. The speed plan is tuned for commands that reach the car
+        within `guard_delay`. With a longer delay the same speeds make the car
+        run wide, so use a slower plan: switch down after 0.5 s of evidence,
+        back up only after 3 s."""
+        if len(self.speed_plans) < 2:
+            return
+        extra = int(round((self.delay - self.guard_delay) / 0.01))
+        want = min(max(extra, 0), len(self.speed_plans) - 1)
+        if want == self.guard_level:
+            self.guard_votes = 0
+            return
+        self.guard_votes += 1
+        if self.guard_votes < (2 if want > self.guard_level else 12):
+            return
+        self.guard_votes = 0
+        self.guard_level = want
+        self.line_speed = self.speed_plans[want]
+        if self.mpc is not None:
+            self.mpc.speed_ref = self.line_speed
+        self.get_logger().warn(
+            f'Command delay {self.delay * 1e3:.0f} ms: speed plan now uses '
+            f'a_lat {self.plan_a_lat[want]:g}' + (' (full)' if want == 0 else ''))
 
     # ------------------------------------------------------------------
     # Black box recorder
@@ -538,7 +587,9 @@ class Driver(Node):
                 f"MPC: {dg['n'] / (now - dg['t0']):.0f} solves/s, {dg['ms'] / dg['n']:.1f} ms each "
                 f"(worst {dg['worst']:.0f} ms), biggest slide {math.degrees(dg['slip']):.0f} deg, "
                 f"top speed {dg['vmax']:.1f} m/s, command delay {self.delay * 1e3:.0f} ms, "
-                f"{self.skipped} repeat messages ignored, sim at {self.rtf:.1f}x real time")
+                f"{self.skipped} repeat messages ignored, sim at {self.rtf:.1f}x real time"
+                + (f", speed plan reduced to a_lat {self.plan_a_lat[self.guard_level]:g}"
+                   if self.guard_level else ""))
             if dg['ms'] / dg['n'] * self.rtf > 600.0 * self.mpc_period and self.mpc.K > 64:
                 self.mpc.K = max(64, int(self.mpc.K * 0.75))
                 self.get_logger().warn(

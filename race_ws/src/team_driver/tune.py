@@ -38,7 +38,7 @@ LOG = os.path.join(OUT, 'log.csv')
 
 # name: (start value, step, lowest allowed, highest allowed)
 SPACE = {
-    'a_lat':         (17.0, 1.0, 8.0, 26.0),
+    'a_lat':         (24.0, 1.0, 8.0, 26.0),
     'steer_use':     (0.95, 0.05, 0.6, 1.0),
     'v_max':         (11.0, 1.0, 8.0, 15.0),
     'margin':        (0.35, 0.025, 0.30, 0.50),
