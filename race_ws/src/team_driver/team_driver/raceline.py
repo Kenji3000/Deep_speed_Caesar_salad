@@ -11,8 +11,12 @@ Pipeline (each step is a function below):
                        at each point while keeping `margin` from every wall
   6. min_curvature     choose those sideways offsets to make the line as
                        straight as possible (a bounded least-squares problem)
-  7. speed_profile     fastest speed at each point given grip, braking and
-                       acceleration limits
+  7. slide_room        extra margin where the car corners at an angle
+                       (tail out, nose in), then steps 5-6 again
+  8. min_time          move the line again, this time to minimise lap time
+  9. speed_profile     fastest speed at each point given steering, braking
+                       and acceleration limits, including the understeer the
+                       car has under power (exit_accel)
 
 Only numpy, scipy and yaml are needed; all three are in the container.
 """
@@ -224,9 +228,20 @@ def normals_of(xy):
 # ---------------------------------------------------------------------------
 # 5. How far left and right the line may move
 # ---------------------------------------------------------------------------
+def margins_for(xy, margin):
+    """`margin` is one number, or (points, values): the margin that applies
+    near each of those points (used where the car needs extra room)."""
+    if isinstance(margin, tuple):
+        pts, vals = margin
+        d = (xy[:, None, 0] - pts[None, :, 0]) ** 2 + (xy[:, None, 1] - pts[None, :, 1]) ** 2
+        return vals[np.argmin(d, axis=1)][:, None]
+    return margin
+
+
 def corridor_bounds(grid, xy, normals, margin, max_offset=1.5, step=None):
     """For each point, march along the normal (both ways) while the clearance
     stays above `margin`. Returns (left, right) as positive distances."""
+    margin = margins_for(xy, margin)
     step = step or grid.res / 2
     offsets = np.arange(0.0, max_offset + step, step)
     bounds = []
@@ -262,7 +277,10 @@ def min_curvature(grid, ref, margin, iterations=3):
         b = -np.concatenate([D2 @ line[:, 0], D2 @ line[:, 1]])
         lo, hi = -right, left
         hi = np.maximum(hi, lo + 1e-6)
-        res = lsq_linear(A, b, bounds=(lo, hi), method='trf', lsmr_tol='auto', max_iter=500)
+        # dense solve: the problem is small (a few hundred unknowns) and the
+        # exact solver is far quicker and steadier here than the sparse one
+        res = lsq_linear(A.toarray(), b, bounds=(lo, hi), method='trf', lsq_solver='exact',
+                         max_iter=200)
         line = line + res.x[:, None] * nrm
         line = resample_closed(line, np.mean(np.linalg.norm(np.diff(line, axis=0), axis=1)))
     return line
@@ -335,6 +353,23 @@ def periodic_spline_basis(n, every):
             e[m] = 1.0
         B[:, j] = CubicSpline(np.append(ctrl, n), e, bc_type='periodic')(t)
     return B, ctrl
+
+
+def slide_room(xy, v_max, a_lat, a_brake, a_accel, steer_use, scale):
+    """Extra room [m] the car needs at each point because it corners at an
+    angle: at speed the tail hangs out and the nose points in. The slide angle
+    in a steady corner is about (sideways acceleration) / (rear tyre
+    stiffness) minus the geometric part LR * curvature."""
+    k = curvature_of(xy)
+    w, _ = fast_speed_squared(xy, v_max, a_lat, a_brake, a_accel, steer_use)
+    slide = np.clip(w * k / (MU * C_SR * GRAV) - LR * k, 0.0, 1.0)      # [rad]
+    extra = scale * (0.29 * np.sin(slide) - 0.155 * (1.0 - np.cos(slide)))
+    # the car will not be exactly where this line is: spread the room along
+    # the lap (about 1.5 m either way) and smooth it
+    n, r = len(k), 7
+    padded = np.r_[extra[-r:], extra, extra[:r]]
+    widest = np.max(np.stack([padded[i:i + n] for i in range(2 * r + 1)]), axis=0)
+    return np.convolve(np.r_[widest[-3:], widest, widest[:3]], np.ones(7) / 7, 'valid')
 
 
 def min_time(grid, ref, margin, v_max, a_lat, a_brake, a_accel, steer_use=0.8,
@@ -413,7 +448,32 @@ def curvature_of(xy, smooth=True):
     return k
 
 
-def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel, steer_use=0.8, trail=1.0):
+# The car's other limits (f1tenth_gym single-track model), for exit_accel().
+MU, C_SF, C_SR = 1.0489, 4.718, 5.4562
+LF, H_CG, S_MAX, GRAV = 0.15875, 0.074, 0.4189, 9.81
+WHEELBASE = LF + LR
+
+
+def understeer(acc):
+    """Understeer gradient K of the car while it accelerates at `acc`:
+    curvature it can hold = steering / (wheelbase + K v^2). Accelerating moves
+    weight off the front wheels, so K grows and the car turns less."""
+    acc = np.asarray(acc, dtype=float)
+    return (LR / (C_SF * (GRAV * LR - acc * H_CG)) - LF / (C_SR * (GRAV * LF + acc * H_CG))) / MU
+
+
+_ACC_TABLE = np.linspace(0.0, A_MAX, 96)
+_K_TABLE = understeer(_ACC_TABLE)          # increasing with acceleration
+
+
+def exit_accel(k, v, steer_use):
+    """Largest acceleration at which the car can still follow curvature `k`
+    at speed `v` with `steer_use` of its steering."""
+    allow = (steer_use * S_MAX / max(k, 1e-6) - WHEELBASE) / max(v * v, 0.25)
+    return float(np.interp(allow, _K_TABLE, _ACC_TABLE))
+
+
+def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel, steer_use=0.8, trail=1.0, exit_use=0.0):
     """Target speed at every point of the line.
       1. corner limit: the speed at which the car can still follow this
          curvature using `steer_use` of its steering (and a_lat, if lower);
@@ -440,6 +500,8 @@ def speed_profile(xy, v_max, v_min, a_lat, a_brake, a_accel, steer_use=0.8, trai
         for i in range(n):
             j = (i + 1) % n
             acc = min(a_accel, A_MAX * V_SWITCH / max(v[i], V_SWITCH))
+            if exit_use > 0.0:      # powering out of a corner makes the car understeer
+                acc = min(acc, max(0.5, exit_accel(max(k[i], k[j]) * exit_use, v[i], steer_use)))
             v[j] = min(v[j], math.sqrt(v[i] ** 2 + 2.0 * acc * ds[i]))
     return np.maximum(v, v_min)
 
@@ -468,7 +530,7 @@ def load_grid(tracks_yaml):
 
 
 def build_raceline(tracks_yaml, margin=0.35, spacing=0.2, blend=1.0, log=print,
-                   optimise_time=True, car=None, time_budget=25.0, grid=None):
+                   optimise_time=True, car=None, time_budget=25.0, grid=None, slip_margin=0.0):
     """Returns (centreline, raceline) as N x 2 arrays in the racing direction.
     blend: 0 = centreline, 1 = full minimum-curvature line."""
     if grid is None:
@@ -481,7 +543,15 @@ def build_raceline(tracks_yaml, margin=0.35, spacing=0.2, blend=1.0, log=print,
     race = min_curvature(grid, centre, margin)
     if optimise_time:
         car = car or dict(v_max=10.0, a_lat=30.0, a_brake=8.0, a_accel=8.0, steer_use=0.8)
-        race = resample_closed(min_time(grid, race, margin, time_budget=time_budget, log=log, **car),
+        room = margin
+        if slip_margin > 0.0:
+            # The car corners at an angle (tail out, nose in), so it needs more
+            # room in fast corners: widen the margin there and redo the line.
+            extra = slide_room(race, scale=slip_margin, **car)
+            room = (race.copy(), margin + extra)
+            race = min_curvature(grid, race, room)
+            log(f'raceline: up to {extra.max():.2f} m extra margin where the car slides')
+        race = resample_closed(min_time(grid, race, room, time_budget=time_budget, log=log, **car),
                                spacing)
     if blend < 1.0:
         idx = np.array([np.argmin(np.hypot(*(race - p).T)) for p in centre])

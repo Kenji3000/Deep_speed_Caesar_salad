@@ -38,14 +38,18 @@ LOG = os.path.join(OUT, 'log.csv')
 
 # name: (start value, step, lowest allowed, highest allowed)
 SPACE = {
-    'a_lat':         (24.0, 1.0, 8.0, 26.0),
-    'steer_use':     (0.95, 0.05, 0.6, 1.0),
-    'v_max':         (11.0, 1.0, 8.0, 15.0),
-    'margin':        (0.35, 0.025, 0.30, 0.50),
-    'a_brake':       (8.0, 0.5, 5.0, 9.5),
-    'trail':         (1.0, 0.2, 0.0, 1.4),
-    'esc_slip':      (0.40, 0.05, 0.25, 0.80),
-    'mpc_w_slip':    (30.0, 10.0, 0.0, 80.0),
+    'a_lat':           (28.0, 1.0, 18.0, 40.0),   # corner speed
+    'steer_use':       (0.95, 0.02, 0.80, 1.0),   # share of the steering a corner may need
+    'exit_use':        (1.0, 0.1, 0.6, 1.6),      # how much to hold back the power on corner exit
+    'margin':          (0.30, 0.02, 0.28, 0.45),  # line to wall, minimum
+    'slip_margin':     (1.0, 0.25, 0.0, 2.0),     # extra room where the car slides
+    'a_brake':         (8.0, 0.5, 5.0, 9.5),
+    'trail':           (1.0, 0.2, 0.0, 1.4),
+    'speed_ff':        (1.0, 0.1, 0.6, 1.3),      # speed-command feed-forward
+    'v_max':           (11.0, 1.0, 8.0, 15.0),
+    'mpc_temperature': (0.03, 0.01, 0.02, 0.2),
+    'esc_slip':        (0.40, 0.05, 0.25, 0.80),
+    'mpc_w_slip':      (30.0, 10.0, 0.0, 80.0),
 }
 
 
@@ -56,6 +60,15 @@ def key_of(params):
 def load_log():
     seen = {}
     if os.path.isfile(LOG):
+        with open(LOG) as f:
+            header = f.readline().strip().split(',')
+        if not all(k in header for k in SPACE):
+            # the log is from an older version of this script (other settings):
+            # keep it under another name and start a fresh one
+            old = os.path.join(OUT, time.strftime('log_before_%Y%m%dT%H%M%S.csv'))
+            os.rename(LOG, old)
+            print(f'The old log has different settings; kept it as {old} and started a new one.')
+            return seen
         with open(LOG) as f:
             for row in csv.DictReader(f):
                 p = {k: float(row[k]) for k in SPACE}

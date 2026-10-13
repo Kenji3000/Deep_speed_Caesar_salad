@@ -2,38 +2,43 @@
 """Team driver: Model Predictive Control along a minimum-time racing line.
 
 How it works
-  1. At start-up, raceline.py reads the track map, seals the cone rows, traces
-     a lap, bends it into a minimum-curvature line and then optimises it for
-     minimum LAP TIME, staying `margin` metres from every wall. Every point
-     gets a target speed from the simulator's real limits: steering
-     capability, braking, acceleration.
-  2. Steering comes from mpc.py: about 50 times a second it simulates a few
-     hundred candidate steering plans one second ahead with the simulator's
-     own physics, scores them (distance from the line, closeness to walls,
-     smoothness) and sends the first command of the best blend.
-  3. Speed is the line's target speed at the car's position; the simulator's
-     own speed controller does the rest.
-     The MPC also allows for the delay between deciding and the car acting
-     (`mpc_latency`), and keeps its own estimate of the wheel angle, which the
-     simulator does not publish.
-  4. Message handling matters as much as the maths. The simulator takes one
-     command per physics step from a 10-deep queue, so the driver sends at
-     most one command every two steps, ignores repeated or stale odometry,
-     and measures the real command delay from how the car's speed responds.
-  5. Delay guard: the speed plan assumes commands reach the car within
-     `guard_delay` (30 ms). If the measured delay is longer on some machine,
-     the driver switches to a slower speed plan on the same line.
-  6. Fallback: `controller:=pure_pursuit` (or any MPC error) switches to Pure
+  1. LINE. At start-up, raceline.py reads the track map, seals the cone rows,
+     traces a lap, bends it into a minimum-curvature line and then optimises
+     it for minimum LAP TIME, staying `margin` metres from every wall - and
+     further where the car will be cornering at an angle (`slip_margin`).
+  2. SPEED PLAN. Every point gets a target speed from the simulated car's
+     real limits: steering, braking, acceleration, and the fact that it
+     understeers under power (so it must not accelerate hard while the
+     corner still needs steering: `exit_use`).
+  3. SPEED COMMAND. The simulator's speed controller is proportional, so
+     asking for the plan speed leaves the car ~1 m/s slow while accelerating
+     and ~0.4 m/s fast while braking. We ask for plan speed + plan
+     acceleration / controller gain, and the car does the plan (`speed_ff`).
+  4. STEERING comes from mpc.py: 50 times a second it simulates 192 candidate
+     steering plans 0.6 s ahead with the simulator's own equations, scores
+     them (distance from the line, closeness to walls, smoothness, sliding)
+     and sends the first command of the best blend.
+  5. DELAY. A command only acts 20-30 ms after it is sent. The driver measures
+     that delay from how the car's speed responds, steps the car's equations
+     through the commands still on their way (`predict`), and plans from
+     where the car WILL be. It also keeps its own estimate of the wheel
+     angle, which the simulator does not publish.
+  6. MESSAGES. The simulator takes one command per physics step from a
+     10-deep queue, so the driver sends at most one command every two steps
+     and ignores repeated or stale odometry.
+  7. DELAY GUARD. If the measured delay is longer than `guard_delay` on some
+     machine, the driver switches to a slower speed plan on the same line.
+  8. FALLBACK. `controller:=pure_pursuit` (or any MPC error) switches to Pure
      Pursuit with understeer compensation on a slower, safer speed plan.
 
-Defaults were found by tune.py (10-lap races in the judged simulator) and
-checked in a replica of its physics. The main speed knob is `a_lat`: 24 gives
-about 9.6 s laps with a 20-30 ms command delay; 25 touches walls. Watch the
+Defaults were tuned in a replica of the judged simulator's physics (checked
+against black-box recordings from the real one) and confirmed with 10-lap
+races in the real simulator. The main speed knob is `a_lat`. Watch the
 "MPC: ..." log line: it shows the solve time, the biggest slide and the
 measured command delay.
 
 Tune without editing code, e.g.:
-    ros2 run team_driver driver --ros-args -p a_lat:=22.0 -p margin:=0.40
+    ros2 run team_driver driver --ros-args -p a_lat:=24.0 -p margin:=0.35
 """
 
 import collections
@@ -69,37 +74,41 @@ class Driver(Node):
         # Line
         self.declare_parameter('tracks_yaml', '/hackathon/maps/tracks.yaml')
         self.declare_parameter('line_csv', '')         # set to a CSV to use that instead
-        self.declare_parameter('margin', 0.35)         # [m] line centre to wall, minimum
+        self.declare_parameter('margin', 0.30)         # [m] line centre to wall, minimum
+        self.declare_parameter('slip_margin', 1.0)     # 0 = off; 1 = extra room where the car corners at an angle
         self.declare_parameter('line_blend', 1.0)      # 0 = centreline, 1 = racing line
         self.declare_parameter('optimise_time', True)  # min-time line (else min-curvature)
         # Speed plan (the simulated car brakes/accelerates up to 9.51 m/s^2;
         # corners are limited by steering, not grip - see raceline.py)
         self.declare_parameter('v_max', 11.0)          # [m/s] top speed
         self.declare_parameter('v_min', 1.5)           # [m/s] slowest target speed
-        self.declare_parameter('a_lat', 24.0)          # [m/s^2] cap on sideways acceleration
+        self.declare_parameter('a_lat', 28.0)          # [m/s^2] cap on sideways acceleration
         self.declare_parameter('steer_use', 0.95)      # share of full steering a corner may need
         self.declare_parameter('a_brake', 8.0)         # [m/s^2] braking before corners
         self.declare_parameter('trail', 1.0)           # 0..1: ease off the brakes while turning in
         self.declare_parameter('a_accel', 9.5)         # [m/s^2] acceleration out of corners
+        self.declare_parameter('exit_use', 1.0)        # 0 = off; 1 = hold back power while the corner needs steering
         self.declare_parameter('speed_preview', 0.0)   # [s] ask for the speed this far ahead
+        self.declare_parameter('speed_ff', 1.0)        # 0 = ask for the plan speed; 1 = also allow for the controller's lag
         # MPC
         self.declare_parameter('mpc_period', 0.02)     # [s] time between commands (and MPC solves)
         self.declare_parameter('mpc_samples', 192)     # candidate plans per solve
-        self.declare_parameter('mpc_horizon', 0.9)     # [s] how far ahead it predicts
+        self.declare_parameter('mpc_horizon', 0.6)     # [s] how far ahead it predicts
         self.declare_parameter('mpc_dt', 0.03)         # [s] prediction step
-        self.declare_parameter('mpc_knots', 7)         # steering plan resolution
+        self.declare_parameter('mpc_knots', 6)         # steering plan resolution
         self.declare_parameter('mpc_w_line', 8.0)      # weight: distance from the line
         self.declare_parameter('mpc_w_wall', 60.0)     # weight: closeness to walls
         self.declare_parameter('mpc_w_rate', 0.4)      # weight: jerky steering
         self.declare_parameter('mpc_w_slip', 30.0)     # weight: sliding sideways too much
         self.declare_parameter('mpc_slip_ok', 0.30)    # [rad] slide angle that is still fine
         self.declare_parameter('mpc_wall_soft', 0.30)  # [m] start avoiding walls inside this
-        self.declare_parameter('mpc_noise', 0.13)      # [rad] spread of candidate plans
-        self.declare_parameter('mpc_temperature', 0.1) # lower = trust only the best plans
+        self.declare_parameter('mpc_wall_hard', 0.17)  # [m] never plan to be closer than this
+        self.declare_parameter('mpc_noise', 0.10)      # [rad] spread of candidate plans
+        self.declare_parameter('mpc_temperature', 0.03) # lower = trust only the best plans
         self.declare_parameter('mpc_latency', 0.02)    # [s] command delay assumed until it is measured
         self.declare_parameter('delay_auto', True)     # measure the real command delay while driving
         self.declare_parameter('delay_guard', True)    # slower speed plan if commands arrive late
-        self.declare_parameter('guard_delay', 0.03)    # [s] full speed plan up to this delay
+        self.declare_parameter('guard_delay', 0.06)    # [s] full speed plan up to this delay
         self.declare_parameter('guard_a_lat', 20.0)    # [m/s^2] a_lat cap at 10 ms above that
         self.declare_parameter('guard_step', 2.0)      # [m/s^2] lower the cap per further 10 ms
         self.declare_parameter('mpc_seed', 0)          # random seed of the plan sampler
@@ -134,13 +143,17 @@ class Driver(Node):
 
         # ---- the line and its speeds (computed once) ----
         self.grid = None
+        self.centre = None             # middle-of-the-track line, for the fallback
         self.line = self.make_line(g)
         self.line_speed = raceline.speed_profile(
             self.line, g('v_max'), g('v_min'), g('a_lat'), g('a_brake'), g('a_accel'),
-            g('steer_use'), g('trail'))
+            g('steer_use'), g('trail'), g('exit_use'))
+        # The fallback (Pure Pursuit) cuts corners a little, so it follows the
+        # middle of the track instead of the racing line, on a much slower plan.
+        self.pp_line = self.centre if self.centre is not None else self.line
         self.pp_speed = raceline.speed_profile(
-            self.line, min(g('pp_v_max'), g('v_max')), g('v_min'), min(g('pp_a_lat'), g('a_lat')),
-            g('a_brake'), g('a_accel'), 1.0, g('trail'))
+            self.pp_line, min(g('pp_v_max'), g('v_max')), g('v_min'), min(g('pp_a_lat'), g('a_lat')),
+            min(g('a_brake'), 6.0), min(g('a_accel'), 6.0), 0.8, g('trail'))
         self.spacing = raceline.lap_length(self.line) / len(self.line)
         # Delay guard: slower speed plans on the same line, for a machine
         # where commands reach the car late. Plan 0 is the full one; plan k is
@@ -150,13 +163,17 @@ class Driver(Node):
         self.guard_delay = g('guard_delay')
         if bool(self._raw('delay_guard')):
             for k in range(1, 6):
-                cap = min(g('a_lat'), max(10.0, g('guard_a_lat') - (k - 1) * g('guard_step')))
+                cap = min(g('a_lat'), max(8.0, g('guard_a_lat') - (k - 1) * g('guard_step')))
                 slower = raceline.speed_profile(
                     self.line, g('v_max'), g('v_min'), cap, g('a_brake'), g('a_accel'),
-                    g('steer_use'), g('trail'))
+                    g('steer_use'), g('trail'), g('exit_use'))
                 self.speed_plans.append(np.minimum(slower, self.line_speed))
                 self.plan_a_lat.append(cap)
         self.guard_level = 0           # which speed plan is in use
+        # What we SEND is not the plan speed itself (see speed_commands).
+        ff = g('speed_ff')
+        self.speed_cmds = [self.speed_commands(p, ff) for p in self.speed_plans]
+        self.line_cmd = self.speed_cmds[0]
         self.guard_votes = 0           # measurements in a row asking for another plan
         self.get_logger().info(
             f'{len(self.line)} line points, {raceline.lap_length(self.line):.1f} m, '
@@ -169,11 +186,12 @@ class Driver(Node):
                 self.controller = 'pure_pursuit'
             else:
                 self.mpc = mpc.MPC(
-                    self.line, self.line_speed, self.grid.clearance,
+                    self.line, self.line_cmd, self.grid.clearance,
                     (self.grid.res, self.grid.ox, self.grid.oy),
                     samples=int(g('mpc_samples')), horizon=g('mpc_horizon'), dt=g('mpc_dt'),
                     knots=int(g('mpc_knots')), w_line=g('mpc_w_line'), w_wall=g('mpc_w_wall'),
-                    w_rate=g('mpc_w_rate'), wall_soft=g('mpc_wall_soft'), noise=g('mpc_noise'),
+                    w_rate=g('mpc_w_rate'), wall_soft=g('mpc_wall_soft'), wall_hard=g('mpc_wall_hard'),
+                    noise=g('mpc_noise'),
                     temperature=g('mpc_temperature'), w_slip=g('mpc_w_slip'),
                     slip_ok=g('mpc_slip_ok'), seed=int(self._raw('mpc_seed')),
                     engine=str(self._raw('mpc_engine')))
@@ -254,8 +272,9 @@ class Driver(Node):
         'mpc_period': (0.01, 0.1), 'mpc_samples': (16, 2048), 'mpc_horizon': (0.3, 2.0),
         'mpc_dt': (0.01, 0.06), 'mpc_knots': (3, 20), 'mpc_noise': (0.005, 0.4),
         'mpc_temperature': (0.02, 5.0), 'mpc_latency': (0.0, 0.1),
+        'slip_margin': (0.0, 2.0), 'speed_ff': (0.0, 1.5), 'exit_use': (0.0, 2.0),
         'guard_delay': (0.0, 0.1), 'guard_a_lat': (5.0, 80.0), 'guard_step': (0.0, 10.0),
-        'mpc_wall_soft': (0.18, 0.8), 'pp_a_lat': (1.0, 9.0), 'pp_v_max': (1.0, 12.0),
+        'mpc_wall_soft': (0.18, 0.8), 'mpc_wall_hard': (0.15, 0.3), 'pp_a_lat': (1.0, 9.0), 'pp_v_max': (1.0, 12.0),
     }
 
     def safe_param(self, name):
@@ -281,9 +300,10 @@ class Driver(Node):
         try:
             car = dict(v_max=g('v_max'), a_lat=g('a_lat'), a_brake=g('a_brake'),
                        a_accel=g('a_accel'), steer_use=g('steer_use'))
-            _, race = raceline.build_raceline(
+            self.centre, race = raceline.build_raceline(
                 g('tracks_yaml'), margin=g('margin'), blend=g('line_blend'),
                 optimise_time=bool(self._raw('optimise_time')), car=car,
+                slip_margin=g('slip_margin'),
                 log=self.get_logger().info, grid=self.grid)
             return race
         except Exception as e:  # never fail to drive because of the planner
@@ -441,6 +461,21 @@ class Driver(Node):
         self.delay = (best + 1) * 0.01
         self.guard_update()
 
+    def speed_commands(self, plan, ff):
+        """Speed to ASK for at each line point so that the car actually does
+        the plan. The simulator's speed controller is proportional:
+        acceleration = gain x (asked speed - real speed). Asking for the plan
+        speed itself therefore leaves the car ~1 m/s slow while accelerating
+        and ~0.4 m/s fast while braking. So ask for plan speed + the plan's
+        acceleration / gain."""
+        n = len(plan)
+        seg = np.linalg.norm(np.roll(self.line, -1, 0) - self.line, axis=1)
+        nxt = np.roll(plan, -1)
+        acc = (nxt ** 2 - plan ** 2) / (2.0 * np.maximum(seg, 1e-6))   # plan's acceleration
+        acc = np.convolve(np.r_[acc[-1:], acc, acc[:1]], np.ones(3) / 3, 'valid')
+        extra = np.where(acc > 0.0, acc / mpc.KP_ACCEL, acc / mpc.KP_BRAKE)
+        return np.clip(plan + ff * extra, 0.5, mpc.V_TOP)
+
     def guard_update(self):
         """Delay guard. The speed plan is tuned for commands that reach the car
         within `guard_delay`. With a longer delay the same speeds make the car
@@ -459,8 +494,9 @@ class Driver(Node):
         self.guard_votes = 0
         self.guard_level = want
         self.line_speed = self.speed_plans[want]
+        self.line_cmd = self.speed_cmds[want]
         if self.mpc is not None:
-            self.mpc.speed_ref = self.line_speed
+            self.mpc.speed_ref = self.line_cmd
         self.get_logger().warn(
             f'Command delay {self.delay * 1e3:.0f} ms: speed plan now uses '
             f'a_lat {self.plan_a_lat[want]:g}' + (' (full)' if want == 0 else ''))
@@ -474,7 +510,7 @@ class Driver(Node):
     def remember(self, now, steering, speed, ranges, angles):
         x, y = self.position
         cx, cy = x + mpc.LR * math.cos(self.yaw), y + mpc.LR * math.sin(self.yaw)
-        idx = self.idx_cog if self.idx_cog is not None else (self.idx or 0)
+        idx = (self.idx_cog if self.idx_cog is not None else (self.idx or 0)) % len(self.line)
         lx, ly = self.line[idx]
         nxt = self.line[(idx + 1) % len(self.line)]
         tx, ty = nxt[0] - lx, nxt[1] - ly
@@ -554,22 +590,66 @@ class Driver(Node):
         self._wall_prev = t_wall
         # Plan from where the car will be when this command takes effect:
         # until then it keeps following the commands already on their way.
-        tau = self.delay
-        if tau > 0.0:
-            course = yaw + self.beta + 0.5 * self.yaw_rate * tau
-            x += v * math.cos(course) * tau
-            y += v * math.sin(course) * tau
-            yaw += self.yaw_rate * tau
-            delta = self.advance_steer(delta, now, now + tau)
+        yaw_rate, beta = self.yaw_rate, self.beta
+        if self.delay > 0.0:
+            x, y, yaw, v, yaw_rate, beta, delta = self.predict(
+                now, self.delay, x, y, yaw, v, yaw_rate, beta, delta)
+        idx = self.mpc.nearest(x, y, self.idx_cog)      # line point where the command will act
         self.mpc.shift(elapsed)
-        self._mpc_steer, _ = self.mpc.solve(
-            x, y, delta, v, yaw, self.yaw_rate, self.beta, self.idx_cog)
+        self._mpc_steer, _ = self.mpc.solve(x, y, delta, v, yaw, yaw_rate, beta, idx)
         took = time.perf_counter() - t_wall
         self.solve_ema = took if self.solve_ema == 0.0 else 0.9 * self.solve_ema + 0.1 * took
         self.report(now, took)
-        ahead_pts = int(round(self.speed * self.speed_preview / self.spacing))
-        speed = float(self.line_speed[(self.idx_cog + ahead_pts) % len(self.line)])
+        ahead_pts = int(round(v * self.speed_preview / self.spacing))
+        speed = float(self.line_cmd[(idx + ahead_pts) % len(self.line)])
         return self._mpc_steer, speed
+
+    def predict(self, now, tau, x, y, yaw, v, yaw_rate, beta, delta):
+        """The car's state `tau` seconds from now. A command we send only takes
+        effect after the command delay; until then the car keeps obeying the
+        commands already on their way. So step the car's equations through
+        those commands and plan from where the car WILL be."""
+        t = now
+        c_yaw = mpc.MU * mpc.MASS / (mpc.INERTIA * mpc.WHEELBASE)
+        while tau > 1e-6:
+            h = min(0.01, tau)
+            rate = mpc.STEER_KP * (self.command_active_at(t) - delta)
+            rate = max(-mpc.SV_MAX, min(mpc.SV_MAX, rate))
+            dv = self.speed_command_active_at(t) - v
+            acc = mpc.KP_ACCEL * dv if dv > 0.0 else mpc.KP_BRAKE * dv
+            top = mpc.A_MAX * mpc.V_SWITCH / v if v > mpc.V_SWITCH else mpc.A_MAX
+            acc = max(-mpc.A_MAX, min(top, acc))
+            if v > 1.5:
+                glr = mpc.G * mpc.LR - acc * mpc.H_CG
+                glf = mpc.G * mpc.LF + acc * mpc.H_CG
+                r_dot = c_yaw * (
+                    mpc.LF * mpc.C_SF * glr * delta
+                    + (mpc.LR * mpc.C_SR * glf - mpc.LF * mpc.C_SF * glr) * beta
+                    - (mpc.LF ** 2 * mpc.C_SF * glr + mpc.LR ** 2 * mpc.C_SR * glf) * yaw_rate / v)
+                b_dot = (mpc.MU / (v * mpc.WHEELBASE)) * (
+                    mpc.C_SF * glr * delta - (mpc.C_SR * glf + mpc.C_SF * glr) * beta
+                    + (mpc.C_SR * glf * mpc.LR - mpc.C_SF * glr * mpc.LF) * yaw_rate / v) - yaw_rate
+                r_new, b_new = yaw_rate + r_dot * h, beta + b_dot * h
+            else:                              # crawling: nothing changes much
+                r_new, b_new = yaw_rate, beta
+            yaw_new = yaw + 0.5 * (yaw_rate + r_new) * h
+            course = 0.5 * (yaw + beta + yaw_new + b_new)
+            v_new = max(v + acc * h, 0.0)
+            x += 0.5 * (v + v_new) * math.cos(course) * h
+            y += 0.5 * (v + v_new) * math.sin(course) * h
+            yaw, yaw_rate, beta, v = yaw_new, r_new, b_new, v_new
+            delta = max(-mpc.S_MAX, min(mpc.S_MAX, delta + rate * h))
+            t += h
+            tau -= h
+        return x, y, yaw, v, yaw_rate, beta, delta
+
+    def speed_command_active_at(self, t):
+        """The speed command the car is acting on at time t (sent earlier)."""
+        t_sent = t - self.delay
+        for when, cmd in reversed(self.spd_hist):
+            if when <= t_sent + 1e-9:
+                return cmd
+        return self.spd_hist[0][1]
 
     def report(self, now, took):
         """Every 5 s of race time, log how the MPC is doing on this machine,
@@ -598,7 +678,7 @@ class Driver(Node):
 
     def plan_pure_pursuit(self):
         x, y = self.position
-        xy, n = self.line, len(self.line)
+        xy, n = self.pp_line, len(self.pp_line)
         # 1. nearest line point (search just around the last one)
         if self.idx is None:
             self.idx = int(np.argmin(np.hypot(xy[:, 0] - x, xy[:, 1] - y)))

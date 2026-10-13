@@ -74,16 +74,6 @@ def _rollout_loops(knots, B, x, y, delta, v, yaw, yaw_rate, beta, idx,
             off = 0.0
             for m in range(M):
                 off += knots[k, m] * B[h, m]
-            cmd = math.atan(WHEELBASE * kappa[ii]) * (1.0 + KC * V * V) + off
-            if cmd > S_MAX:
-                cmd = S_MAX
-            elif cmd < -S_MAX:
-                cmd = -S_MAX
-            sv = STEER_KP * (cmd - D)
-            if sv > SV_MAX:
-                sv = SV_MAX
-            elif sv < -SV_MAX:
-                sv = -SV_MAX
             dv = speed_ref[(ii + preview) % n] - V
             acc = KP_ACCEL * dv if dv > 0.0 else KP_BRAKE * dv
             upper = A_MAX * V_SWITCH / max(V, 1e-3) if V > V_SWITCH else A_MAX
@@ -93,6 +83,18 @@ def _rollout_loops(knots, B, x, y, delta, v, yaw, yaw_rate, beta, idx,
                 acc = -A_MAX
             glr = G * LR - acc * H_CG
             glf = G * LF + acc * H_CG
+            # feed-forward steering for the line's curvature here (more at
+            # speed, because the car understeers), plus this plan's offset
+            cmd = math.atan(kappa[ii] * WHEELBASE * (1.0 + KC * V * V)) + off
+            if cmd > S_MAX:
+                cmd = S_MAX
+            elif cmd < -S_MAX:
+                cmd = -S_MAX
+            sv = STEER_KP * (cmd - D)
+            if sv > SV_MAX:
+                sv = SV_MAX
+            elif sv < -SV_MAX:
+                sv = -SV_MAX
             Vs = V if V > 1.5 else 1.5
             r_dot = c_yaw * (
                 LF * C_SF * glr * D + (LR * C_SR * glf - LF * C_SF * glr) * BETA
@@ -184,7 +186,7 @@ except Exception:          # Numba not installed, or it cannot compile here
 
 class MPC:
     def __init__(self, line, line_speed, clearance, grid_meta, *,
-                 samples=192, horizon=0.9, dt=0.03, knots=7,
+                 samples=192, horizon=0.6, dt=0.03, knots=6,
                  w_line=4.0, w_wall=60.0, w_rate=0.4, w_end=3.0,
                  wall_soft=0.30, wall_hard=0.17, noise=0.07, temperature=0.4,
                  w_slip=30.0, slip_ok=0.30,
@@ -277,7 +279,8 @@ class MPC:
         self.plan = wts @ knots
         self.last_cost = cmin_
         # steering to send now: feed-forward at the car plus the plan's first offset
-        cmd0 = math.atan(WHEELBASE * self.kappa[idx]) * (1.0 + KC * v * v) + float(self.plan[0])
+        v = max(v, 0.0)
+        cmd0 = math.atan(self.kappa[idx] * WHEELBASE * (1.0 + KC * v * v)) + float(self.plan[0])
         return max(-S_MAX, min(S_MAX, cmd0)), cmin_
 
     # ------------------------------------------------------------------
@@ -341,19 +344,19 @@ class MPC:
         ii = np.full(K, idx, dtype=np.int64)
         for h in range(H):
             # feed-forward steering for the line's curvature here, plus the offset
-            kap = self.kappa[ii]
-            cmd = np.arctan(WHEELBASE * kap) * (1.0 + KC * V * V) + offs[:, h]
-            np.clip(cmd, -S_MAX, S_MAX, out=cmd)
             # --- the simulator's actuators ---
-            sv = np.clip(STEER_KP * (cmd - D), -SV_MAX, SV_MAX)
             vref = self.speed_ref[(ii + int(self.preview_pts)) % n]
             dv = vref - V
             acc = np.where(dv > 0.0, KP_ACCEL * dv, KP_BRAKE * dv)
             upper = np.where(V > V_SWITCH, A_MAX * V_SWITCH / np.maximum(V, 1e-3), A_MAX)
             acc = np.clip(acc, -A_MAX, upper)
-            # --- single-track dynamics (kinematic below 1.5 m/s, as it is stiff there) ---
             glr = G * LR - acc * H_CG
             glf = G * LF + acc * H_CG
+            # feed-forward steering for the line's curvature here, plus the offset
+            cmd = np.arctan(self.kappa[ii] * WHEELBASE * (1.0 + KC * V * V)) + offs[:, h]
+            np.clip(cmd, -S_MAX, S_MAX, out=cmd)
+            sv = np.clip(STEER_KP * (cmd - D), -SV_MAX, SV_MAX)
+            # --- single-track dynamics (kinematic below 1.5 m/s, as it is stiff there) ---
             Vs = np.maximum(V, 1.5)
             r_dot = (MU * MASS / (INERTIA * WHEELBASE)) * (
                 LF * C_SF * glr * D + (LR * C_SR * glf - LF * C_SF * glr) * BETA
